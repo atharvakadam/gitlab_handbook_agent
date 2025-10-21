@@ -1,10 +1,10 @@
 from langchain_core.tools import tool
-from agent.openai_wrapper import OpenAIWrapper
+from src.agent.openai_wrapper import OpenAIWrapper
 from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional
-import os, json, asyncio
+import os, json, asyncio, re
 from datetime import datetime
-from agent.filters import load_allowlists
+from src.agent.filters import load_allowlists
 
 openai_client = OpenAIWrapper()
 
@@ -52,181 +52,125 @@ def _stitch_adjacent(results: List[Dict[str, Any]], max_per_doc: int = 2) -> Lis
             })
     return sorted(stitched, key=lambda x: x["score"], reverse=True)
 
-def _parse_iso(dt: Optional[str]) -> Optional[datetime]:
-    if not dt:
-        return None
-    # Accept "YYYY-MM-DD" or full ISO
+# Helper functions for: allowlists, safe $vectorSearch.filter building, and simple intent->section suggestions.
+ALLOW = None  # populated by load_allowlists()
+
+def load_allowlists():
+    """Call this once at service startup and cache globally."""
+    global ALLOW
+    coll = client.db.collection
+    def distinct_nonempty(field):
+        vals = [v for v in coll.distinct(field) if isinstance(v, str) and v.strip()]
+        return set(vals)
+    ALLOW = {
+        "sections": distinct_nonempty("section"),
+        "sp1":      distinct_nonempty("section_prefix1"),
+        "sp2":      distinct_nonempty("section_prefix2"),
+        "access":   set(sum([g if isinstance(g, list) else [g] for g in coll.distinct("access_groups")], [])),
+        "sources":  distinct_nonempty("source"),
+        "tags":     set(sum([t if isinstance(t, list) else [t] for t in coll.distinct("tags")], [])),
+    }
+    return ALLOW
+
+def _valid_list(vals, allowed):
+    if not vals: return []
+    return [v for v in vals if v in allowed]
+
+def parse_iso_dt(s):
+    if not s: return None
+    s = s.replace("Z","")
     try:
-        if len(dt) == 10:
-            return datetime.fromisoformat(dt)  # naive date
-        return datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        return datetime.fromisoformat(s)
     except Exception:
         return None
 
-def _build_vector_filter(
+# Simple deterministic suggestion based on query text -> section_prefix1
+SECTION_PREFIX1_RULES = [
+    (r"\b(leave|parental|maternity|paternity|pto|vacation|sick|absence)\b", ["people-group", "total-rewards"]),
+    (r"\b(benefit|insurance|medical|dental|vision|perk)\b", ["total-rewards"]),
+    (r"\b(policy|legal|contract|nda|compliance|ethic)\b", ["legal"]),
+    (r"\b(okr|goal|roadmap|planning)\b", ["product-development"]),
+    (r"\b(sev|incident|on[- ]?call|pagerduty)\b", ["security", "engineering"]),
+    (r"\b(hiring|recruit|referral|interview)\b", ["hiring", "people-group"]),
+    (r"\b(expense|reimburse|procure|invoice|vendor)\b", ["finance", "business-technology"]),
+]
+
+def suggest_sp1(query, max_pick=2):
+    q = query.lower()
+    hits = []
+    for pat, groups in SECTION_PREFIX1_RULES:
+        if re.search(pat, q):
+            hits.extend(groups)
+    # keep only allowed + unique
+    if ALLOW and "sp1" in ALLOW:
+        hits = [h for h in hits if h in ALLOW["sp1"]]
+    seen = []
+    for h in hits:
+        if h not in seen:
+            seen.append(h)
+    return seen[:max_pick]
+
+def build_vector_filter(
     *,
-    user_groups: Optional[List[str]],
-    sources: Optional[List[str]],
-    tags_all: Optional[List[str]],
-    tags_any: Optional[List[str]],
-    updated_after: Optional[str],
-    updated_before: Optional[str],
-) -> Optional[dict]:
-    """Return a Mongo query usable as $vectorSearch.filter, or None."""
+    user_groups=None,
+    sources=None,
+    sections_any=None,   # full section strings
+    sp1_any=None,        # section_prefix1
+    sp2_any=None,        # section_prefix2
+    tags_all=None,
+    tags_any=None,
+    updated_after=None,
+    updated_before=None,
+):
+    """Return a dict suitable for $vectorSearch.filter, or None if no valid constraints."""
+    if ALLOW is None:
+        raise RuntimeError("filters.load_allowlists(coll) must be called once at startup")
     clauses = []
 
-    # Only docs readable by the requester (groups)
-    if user_groups:
-        clauses.append({"access_groups": {"$in": user_groups}})
+    # access groups (default to 'all')
+    groups = _valid_list(user_groups, ALLOW["access"]) or ["all"]
+    clauses.append({"access_groups": {"$in": groups}})
 
-    # Restrict to specific sources
-    if sources:
-        clauses.append({"source": {"$in": sources}})
+    # sources
+    srcs = _valid_list(sources, ALLOW["sources"])
+    if srcs:
+        clauses.append({"source": {"$in": srcs}})
 
-    # Tags constraints
-    if tags_all:   # doc must contain ALL
+    # sections
+    secs = _valid_list(sections_any, ALLOW["sections"])
+    if secs:
+        clauses.append({"section": {"$in": secs}})
+    sp1  = _valid_list(sp1_any, ALLOW["sp1"])
+    if sp1:
+        clauses.append({"section_prefix1": {"$in": sp1}})
+    sp2  = _valid_list(sp2_any, ALLOW["sp2"])
+    if sp2:
+        clauses.append({"section_prefix2": {"$in": sp2}})
+
+    # tags
+    if tags_all:
         clauses.append({"tags": {"$all": tags_all}})
-    if tags_any:   # doc must contain ANY
+    if tags_any:
         clauses.append({"tags": {"$in": tags_any}})
 
-    # Updated_at bounds (requires ISODate in Mongo)
-    gte = _parse_iso(updated_after)
-    lte = _parse_iso(updated_before)
+    # dates (expect updated_at_dt as Date)
+    gte = parse_iso_dt(updated_after)
+    lte = parse_iso_dt(updated_before)
     if gte or lte:
         rng = {}
-        if gte:
-            rng["$gte"] = gte
-        if lte:
-            rng["$lte"] = lte
-        clauses.append({"updated_at": rng})
+        if gte: rng["$gte"] = gte
+        if lte: rng["$lte"] = lte
+        clauses.append({"updated_at_dt": rng})
 
+    clauses = [c for c in clauses if c]
     if not clauses:
         return None
     return {"$and": clauses} if len(clauses) > 1 else clauses[0]
 
-# # filters.py
-# # Helper functions for: allowlists, safe $vectorSearch.filter building, and simple intent->section suggestions.
-# from datetime import datetime
-# import re
 
-# ALLOW = None  # populated by load_allowlists()
-
-# def load_allowlists():
-#     """Call this once at service startup and cache globally."""
-#     global ALLOW
-#     coll = client.db.collection
-#     def distinct_nonempty(field):
-#         vals = [v for v in coll.distinct(field) if isinstance(v, str) and v.strip()]
-#         return set(vals)
-#     ALLOW = {
-#         "sections": distinct_nonempty("section"),
-#         "sp1":      distinct_nonempty("section_prefix1"),
-#         "sp2":      distinct_nonempty("section_prefix2"),
-#         "access":   set(sum([g if isinstance(g, list) else [g] for g in coll.distinct("access_groups")], [])),
-#         "sources":  distinct_nonempty("source"),
-#         "tags":     set(sum([t if isinstance(t, list) else [t] for t in coll.distinct("tags")], [])),
-#     }
-#     return ALLOW
-
-# def _valid_list(vals, allowed):
-#     if not vals: return []
-#     return [v for v in vals if v in allowed]
-
-# def parse_iso_dt(s):
-#     if not s: return None
-#     s = s.replace("Z","")
-#     try:
-#         return datetime.fromisoformat(s)
-#     except Exception:
-#         return None
-
-# # Simple deterministic suggestion based on query text -> section_prefix1
-# SECTION_PREFIX1_RULES = [
-#     (r"\b(leave|parental|maternity|paternity|pto|vacation|sick|absence)\b", ["people-group", "total-rewards"]),
-#     (r"\b(benefit|insurance|medical|dental|vision|perk)\b", ["total-rewards"]),
-#     (r"\b(policy|legal|contract|nda|compliance|ethic)\b", ["legal"]),
-#     (r"\b(okr|goal|roadmap|planning)\b", ["product-development"]),
-#     (r"\b(sev|incident|on[- ]?call|pagerduty)\b", ["security", "engineering"]),
-#     (r"\b(hiring|recruit|referral|interview)\b", ["hiring", "people-group"]),
-#     (r"\b(expense|reimburse|procure|invoice|vendor)\b", ["finance", "business-technology"]),
-# ]
-
-# def suggest_sp1(query, max_pick=2):
-#     q = query.lower()
-#     hits = []
-#     for pat, groups in SECTION_PREFIX1_RULES:
-#         if re.search(pat, q):
-#             hits.extend(groups)
-#     # keep only allowed + unique
-#     if ALLOW and "sp1" in ALLOW:
-#         hits = [h for h in hits if h in ALLOW["sp1"]]
-#     seen = []
-#     for h in hits:
-#         if h not in seen:
-#             seen.append(h)
-#     return seen[:max_pick]
-
-# def build_vector_filter(
-#     *,
-#     user_groups=None,
-#     sources=None,
-#     sections_any=None,   # full section strings
-#     sp1_any=None,        # section_prefix1
-#     sp2_any=None,        # section_prefix2
-#     tags_all=None,
-#     tags_any=None,
-#     updated_after=None,
-#     updated_before=None,
-# ):
-#     """Return a dict suitable for $vectorSearch.filter, or None if no valid constraints."""
-#     if ALLOW is None:
-#         raise RuntimeError("filters.load_allowlists(coll) must be called once at startup")
-#     clauses = []
-
-#     # access groups (default to 'all')
-#     groups = _valid_list(user_groups, ALLOW["access"]) or ["all"]
-#     clauses.append({"access_groups": {"$in": groups}})
-
-#     # sources
-#     srcs = _valid_list(sources, ALLOW["sources"])
-#     if srcs:
-#         clauses.append({"source": {"$in": srcs}})
-
-#     # sections
-#     secs = _valid_list(sections_any, ALLOW["sections"])
-#     if secs:
-#         clauses.append({"section": {"$in": secs}})
-#     sp1  = _valid_list(sp1_any, ALLOW["sp1"])
-#     if sp1:
-#         clauses.append({"section_prefix1": {"$in": sp1}})
-#     sp2  = _valid_list(sp2_any, ALLOW["sp2"])
-#     if sp2:
-#         clauses.append({"section_prefix2": {"$in": sp2}})
-
-#     # tags
-#     if tags_all:
-#         clauses.append({"tags": {"$all": tags_all}})
-#     if tags_any:
-#         clauses.append({"tags": {"$in": tags_any}})
-
-#     # dates (expect updated_at_dt as Date)
-#     gte = parse_iso_dt(updated_after)
-#     lte = parse_iso_dt(updated_before)
-#     if gte or lte:
-#         rng = {}
-#         if gte: rng["$gte"] = gte
-#         if lte: rng["$lte"] = lte
-#         clauses.append({"updated_at_dt": rng})
-
-#     clauses = [c for c in clauses if c]
-#     if not clauses:
-#         return None
-#     return {"$and": clauses} if len(clauses) > 1 else clauses[0]
-
-
-# ALLOW = load_allowlists()
-# print("[filters] loaded allowlists:",
-#       {k: (len(v) if hasattr(v, "__len__") else "ok") for k,v in ALLOW.items()})
+ALLOW = load_allowlists()
+print("[filters] loaded allowlists:",
+      {k: (len(v) if hasattr(v, "__len__") else "ok") for k,v in ALLOW.items()})
 
 # ----------------- Embedding -----------------
 # --- SentenceTransformers model cache + warmup flags ---
@@ -337,18 +281,24 @@ import time
 
 # ----------------- Tool: vector retrieval -----------------
 @tool("generate_retrieval_response")
-async def generate_retrieval_response(user_query: str,
-                                      k: int = 15,
-                                      top: int = 6,
-                                      max_per_doc: int = 2,
-                                      # NEW: optional prefilters
-                                      user_groups: Optional[List[str]] = None,     # e.g., ["all", "eng", "sales"]
-                                      sources: Optional[List[str]] = None,         # e.g., ["gitlab-handbook"]
-                                      tags_all: Optional[List[str]] = None,        # require ALL tags
-                                      tags_any: Optional[List[str]] = None,        # require ANY tag
-                                      updated_after: Optional[str] = None,         # ISO8601 "2025-01-01T00:00:00Z"
-                                      updated_before: Optional[str] = None,        # ISO8601
-                                    ):
+async def generate_retrieval_response(
+    user_query: str,
+    k: int = 15,
+    top: int = 6,
+    max_per_doc: int = 2,
+    # NEW: optional prefilters
+    user_groups: Optional[List[str]] = None,   # e.g., ["all"]
+    sources: Optional[List[str]] = None,       # e.g., ["gitlab-handbook"]
+    # section filters (prefer sp1_any; sections_any is full path if you expose it)
+    sp1_any: Optional[List[str]] = None,       # e.g., ["people-group","total-rewards"]
+    sp2_any: Optional[List[str]] = None,       # e.g., ["engineering/architecture"]
+    sections_any: Optional[List[str]] = None,  # full `section` strings (advanced)
+    # tags & recency (wired for future)
+    tags_all: Optional[List[str]] = None,
+    tags_any: Optional[List[str]] = None,
+    updated_after: Optional[str] = None,       # ISO8601 "2025-01-01T00:00:00Z"
+    updated_before: Optional[str] = None,      # ISO8601
+):
     """
     Retrieve relevant passages from MongoDB Atlas Vector Search for a user's info-seeking query.
     Returns a JSON string with:
@@ -365,6 +315,9 @@ async def generate_retrieval_response(user_query: str,
     print("[vector] args:", json.dumps({
         "user_groups": user_groups,
         "sources": sources,
+        "sp1_any": sp1_any,
+        "sp2_any": sp2_any,
+        "sections_any": sections_any,
         "tags_all": tags_all,
         "tags_any": tags_any,
         "updated_after": updated_after,
@@ -384,18 +337,35 @@ async def generate_retrieval_response(user_query: str,
     try:
         coll = client[db][collection]
 
-        # Build prefilter for Atlas Vector Search
-        avs_filter = _build_vector_filter(
+        # === BUILD SAFE PREFILTER (validated against allowlists) ===
+        # Defaults so RBAC & source are always present but harmless
+        if not user_groups:
+            user_groups = ["all"]
+        if not sources:
+            sources = ["gitlab-handbook"]
+
+        # right before auto_sp1 assignment
+        if sp1_any:
+            sp1_any = sp1_any[:2]
+
+        # If caller didn't pass section hints, use a deterministic suggestion from the query
+        auto_sp1 = sp1_any or suggest_sp1(user_query)
+
+        avs_filter = build_vector_filter(
             user_groups=user_groups,
             sources=sources,
+            sections_any=sections_any,    # keep None unless you explicitly plan to pass full sections
+            sp1_any=auto_sp1,             # section_prefix1 (0–2 items)
+            sp2_any=sp2_any,              # optional
             tags_all=tags_all,
             tags_any=tags_any,
             updated_after=updated_after,
             updated_before=updated_before,
         )
         if avs_filter:
-            print(f"[vector] filter: {json.dumps(avs_filter, default=str)}")
+            print("[vector] filter:", json.dumps(avs_filter, default=str))
 
+        # === REPLACE your existing vs/pipeline with this ===
         vs = {
             "index": index,
             "path": "embedding",
@@ -406,8 +376,8 @@ async def generate_retrieval_response(user_query: str,
         if avs_filter:
             vs["filter"] = avs_filter
 
-        # >>> add this:
-        print("[vector] $vectorSearch:", json.dumps({k: (v if k != "queryVector" else "[...vector...]") for k, v in vs.items()}, default=str))
+        print("[vector] $vectorSearch:",
+            json.dumps({k: (v if k != "queryVector" else "[redacted]") for k, v in vs.items()}, default=str))
 
         pipeline = [
             {"$vectorSearch": vs},
@@ -419,10 +389,13 @@ async def generate_retrieval_response(user_query: str,
                 "web_url": 1,
                 "chunk_text": 1,
                 "score": {"$meta": "vectorSearchScore"},
+                # helpful for debugging/filter audits:
+                "section": 1,
+                "section_prefix1": 1,
+                "section_prefix2": 1,
                 "source": 1,
-                "tags": 1,
-                "updated_at": 1,
                 "access_groups": 1,
+                "updated_at": 1,
             }},
         ]
 
@@ -437,8 +410,15 @@ async def generate_retrieval_response(user_query: str,
     except Exception as e:
         return json.dumps({"error": f"mongo_query_failed: {e!s}"})
 
-    if not hits:
-        return json.dumps({"stitched": [], "total_hits": 0})
+    # Fallback: if filtered search returned 0, retry unfiltered
+    if not hits and "filter" in vs:
+        print("[vector] no hits with filter; retrying unfiltered")
+        vs.pop("filter", None)
+        pipeline[0] = {"$vectorSearch": vs}
+        t_db0 = time.perf_counter()
+        hits = await asyncio.to_thread(lambda: list(coll.aggregate(pipeline)))
+        t_db1 = time.perf_counter()
+        print(f"[vector] db query (fallback) time: {t_db1 - t_db0:.2f}s")
 
     t_stitch0 = time.perf_counter()
     stitched = _stitch_adjacent(hits, max_per_doc=int(max_per_doc))
@@ -447,7 +427,7 @@ async def generate_retrieval_response(user_query: str,
     stitched = stitched[: int(top)]
 
     # Build a flat sources list that the LLM can easily cite
-    sources = [
+    citation_sources = [
         {
             "i": i + 1,
             "title": s.get("title"),
@@ -461,7 +441,7 @@ async def generate_retrieval_response(user_query: str,
 
     payload = {
         "stitched": stitched,   # full text blocks (for synthesis)
-        "sources": sources,     # lightweight linkable list
+        "sources": citation_sources,     # lightweight linkable list
         "total_hits": len(hits),
         # NEW: timing breakdown (milliseconds)
         "timings_ms": {

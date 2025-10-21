@@ -7,8 +7,8 @@ from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 from langsmith import trace
 from pydantic import BaseModel
-from agent.setup_tools import tools
-from typing import (
+from src.agent.setup_tools import tools
+from typing_extensions import (
     Annotated,
     Sequence,
     TypedDict,
@@ -101,12 +101,50 @@ def call_model(
     "When the user asks about internal docs/policies/handbooks, call the tool "
     "`generate_retrieval_response` first.\n"
 
-    # "When answering about internal docs, you MUST first extract likely filters (groups, source, tags, recency) and then call `generate_retrieval_response` with those filters.\n"
-    # "Prefer minimal, high-precision filters; do not over-filter.\n"
-    # "Examples:\n"
-    # "- \"engineering referral policy\" → tags_any: [\"hiring\",\"referral\",\"eng\"]\n"
-    # "- \"recent parental leave changes\" → tags_any: [\"benefits\",\"leave\"], updated_after: last 90 days\n"
-    # "- \"legal misconduct reporting\" → tags_any: [\"legal\",\"ethics\",\"reporting\"]\n; sources: [\"gitlab-handbook\"]\n"
+    """   When you call the `generate_retrieval_response` tool:
+
+    • Always include: user_groups=["all"], sources=["gitlab-handbook"].
+    • Consider adding at most TWO section groups (sp1_any) **iff** the query clearly names a domain.
+    • If unsure, omit sp1_any (unfiltered search). Do NOT invent values.
+
+    Allowed section groups (sp1_any): {SECTION_PREFIX1_MENU}
+    Return ONLY JSON with these keys:
+    {"user_query": "...", "k": 15, "top": 6, "max_per_doc": 2,
+    "user_groups": ["all"], "sources": ["gitlab-handbook"],
+    "sp1_any": [], "sp2_any": [], "tags_all": [], "tags_any": [],
+    "updated_after": null, "updated_before": null}
+    """
+
+    """
+    User: "What is GitLab's parental leave policy?"
+    Tool args JSON:
+    {"user_query":"What is GitLab's parental leave policy?",
+    "user_groups":["all"], "sources":["gitlab-handbook"],
+    "sp1_any":["people-group","total-rewards"]}
+
+    User: "SEV1 vs SEV2 definitions"
+    Tool args JSON:
+    {"user_query":"SEV1 vs SEV2 definitions",
+    "user_groups":["all"], "sources":["gitlab-handbook"],
+    "sp1_any":["security"]}
+
+    User: "How do I expense a laptop?"
+    Tool args JSON:
+    {"user_query":"How do I expense a laptop?",
+    "user_groups":["all"], "sources":["gitlab-handbook"],
+    "sp1_any":["finance","business-technology"]}
+
+    User: "OKR review cadence"
+    Tool args JSON:
+    {"user_query":"OKR review cadence",
+    "user_groups":["all"], "sources":["gitlab-handbook"],
+    "sp1_any":["product-development"]}
+
+    User: "help"
+    Tool args JSON:
+    {"user_query":"help",
+    "user_groups":["all"], "sources":["gitlab-handbook"]}
+    """
 
     "The tool returns JSON with keys:\n"
     "  - 'stitched': ranked context blocks\n"
