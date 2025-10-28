@@ -14,6 +14,12 @@ load_dotenv()
 from pymongo import MongoClient
 HAS_ST = None  # will be determined lazily
 
+try:
+    from sentence_transformers import CrossEncoder
+    HAS_CE = True
+except Exception:
+    HAS_CE = False
+
 mongo_uri = os.getenv("MONGO_URI")
 if not mongo_uri:
     raise ValueError("MONGO_URI not set")
@@ -298,6 +304,11 @@ async def generate_retrieval_response(
     tags_any: Optional[List[str]] = None,
     updated_after: Optional[str] = None,       # ISO8601 "2025-01-01T00:00:00Z"
     updated_before: Optional[str] = None,      # ISO8601
+    # reranking
+    rerank: bool = False,
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    rerank_top_k: int = 10,    # how many of the ANN hits to re-score (<= k)
+    rerank_batch_size: int = 8,
 ):
     """
     Retrieve relevant passages from MongoDB Atlas Vector Search for a user's info-seeking query.
@@ -407,6 +418,52 @@ async def generate_retrieval_response(
         t_db1 = time.perf_counter()
         print(f"[vector] db query time: {t_db1 - t_db0:.2f}s")
 
+        # === Optional cross-encoder re-ranking ===
+        t_rr0 = time.perf_counter()
+        if rerank and hits:
+            # restrict to the first N for re-scoring
+            cand = hits[: min(len(hits), int(rerank_top_k))]
+
+            if reranker_model.startswith("cross-encoder/"):
+                if not HAS_CE:
+                    print("[rerank] sentence-transformers CrossEncoder not available; skipping")
+                else:
+                    ce = CrossEncoder(reranker_model)
+                    pairs = [(user_query, h["chunk_text"]) for h in cand]
+                    # run in a worker thread to avoid blocking event loop
+                    def _score():
+                        return ce.predict(pairs, batch_size=rerank_batch_size).tolist()
+                    scores = await asyncio.to_thread(_score)
+                    for s, h in zip(scores, cand):
+                        h["ce_score"] = float(s)
+                    # sort by CE score desc, then keep the new ordering + append remainder
+                    cand.sort(key=lambda x: x.get("ce_score", 0.0), reverse=True)
+                    hits = cand + hits[len(cand):]
+
+            elif reranker_model.startswith("BAAI/"):
+                if not HAS_BGE:
+                    print("[rerank] FlagEmbedding not available; skipping")
+                else:
+                    # BGE returns higher score = more relevant (typically cosine-like)
+                    bge = FlagReranker(reranker_model, use_fp16=False)
+                    pairs = [[user_query, h["chunk_text"]] for h in cand]
+                    def _score_bge():
+                        # returns a list of floats
+                        return bge.compute_score(pairs, normalize=True, batch_size=rerank_batch_size)
+                    scores = await asyncio.to_thread(_score_bge)
+                    for s, h in zip(scores, cand):
+                        h["ce_score"] = float(s)
+                    cand.sort(key=lambda x: x.get("ce_score", 0.0), reverse=True)
+                    hits = cand + hits[len(cand):]
+
+            else:
+                print(f"[rerank] unsupported model: {reranker_model}; skipping")
+
+        t_rr1 = time.perf_counter()
+        rr_ms = round((t_rr1 - t_rr0)*1000)
+        if rerank:
+            print(f"[rerank] model={reranker_model} took {rr_ms} ms on {min(len(hits), int(rerank_top_k))} pairs")
+
     except Exception as e:
         return json.dumps({"error": f"mongo_query_failed: {e!s}"})
 
@@ -449,6 +506,7 @@ async def generate_retrieval_response(
             "db":     round((t_db1 - t_db0)*1000),
             "stitch": round((t_stitch1 - t_stitch0)*1000),
             "total_tool": round((t_stitch1 - t0)*1000),
+            "rerank": rr_ms if rerank else 0,
         },
         "debug": {
             "index": index,

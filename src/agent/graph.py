@@ -1,4 +1,4 @@
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, START, END
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import ToolMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -184,11 +184,14 @@ workflow.add_node("agent", call_model)
 workflow.add_node("tools", tool_node)
 
 # This is our new node we're defining
-workflow.add_node(delete_messages)
+# workflow.add_node(delete_messages)
+workflow.add_node("delete_messages", delete_messages)
 
 # Set the entrypoint as `agent`
 # This means that this node is the first one called
-workflow.set_entry_point("agent")
+# workflow.set_entry_point("agent")
+workflow.add_edge(START, "agent")
+
 
 # We now add a conditional edge
 workflow.add_conditional_edges(
@@ -203,7 +206,10 @@ workflow.add_conditional_edges(
     # What will happen is we will call `should_continue`, and then the output of that
     # will be matched against the keys in this mapping.
     # Based on which one it matches, that node will then be called.
-
+    {
+        "tools": "tools",
+        "delete_messages": "delete_messages"
+    }
     # {
     #     # If `tools`, then we call the tool node.
     #     "continue": "tools",
@@ -215,7 +221,6 @@ workflow.add_conditional_edges(
 # We now add a normal edge from `tools` to `agent`.
 # This means that after `tools` is called, `agent` node is called next.
 workflow.add_edge("tools", "agent")
-# workflow.add_edge("SQLAgent", "agent")
 
 # This is the new edge we're adding: after we delete messages, we finish
 workflow.add_edge("delete_messages", END)
